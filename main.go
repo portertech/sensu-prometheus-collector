@@ -40,24 +40,27 @@ type Metric struct {
 	Value float64
 }
 
-func CreateJSONMetrics(samples model.Vector) string {
+func CreateJSONMetrics(samples model.Vector, metricIgnore string, metricExcept string) string {
 	metrics := []Metric{}
 
 	for _, sample := range samples {
-		metric := Metric{}
 
-		for name, value := range sample.Metric {
-			tag := Tag{
-				Name:  name,
-				Value: value,
+		if !skipMetric(metricIgnore, metricExcept, string(sample.Metric["__name__"])) {
+			metric := Metric{}
+
+			for name, value := range sample.Metric {
+				tag := Tag{
+					Name:  name,
+					Value: value,
+				}
+
+				metric.Tags = append(metric.Tags, tag)
 			}
 
-			metric.Tags = append(metric.Tags, tag)
+			metric.Value = float64(sample.Value)
+
+			metrics = append(metrics, metric)
 		}
-
-		metric.Value = float64(sample.Value)
-
-		metrics = append(metrics, metric)
 	}
 
 	jsonMetrics, _ := json.Marshal(metrics)
@@ -65,51 +68,30 @@ func CreateJSONMetrics(samples model.Vector) string {
 	return string(jsonMetrics)
 }
 
-func CreateGraphiteMetrics(samples model.Vector, metricPrefix string) string {
+func CreateGraphiteMetrics(samples model.Vector, metricPrefix string, metricIgnore string, metricExcept string) string {
 	metrics := ""
 
 	for _, sample := range samples {
-		name := fmt.Sprintf("%s%s", metricPrefix, sample.Metric["__name__"])
 
-		value := strconv.FormatFloat(float64(sample.Value), 'f', -1, 64)
+		if !skipMetric(metricIgnore, metricExcept, string(sample.Metric["__name__"])) {
+			metric := fmt.Sprintf("%s%s", metricPrefix, sample.Metric["__name__"])
 
-		now := time.Now()
-		timestamp := now.Unix()
-
-		metric := fmt.Sprintf("%s %s %d\n", name, value, timestamp)
-
-		metrics += metric
-	}
-
-	return metrics
-}
-
-func CreateInfluxMetrics(samples model.Vector, metricPrefix string) string {
-	metrics := ""
-
-	for _, sample := range samples {
-		metric := fmt.Sprintf("%s%s", metricPrefix, sample.Metric["__name__"])
-
-		for name, value := range sample.Metric {
-			if name != "__name__" {
-				tags := fmt.Sprintf(",%s=%s", name, value)
-				if !strings.Contains(tags, "\n") && strings.Count(tags, "=") == 1 {
-					metric += tags
+			for name, value := range sample.Metric {
+				if name != "__name__" {
+					tags := fmt.Sprintf(";%s=%s", name, value)
+					if !strings.Contains(tags, "\n") && strings.Count(tags, "=") == 1 {
+						metric += tags
+					}
 				}
 			}
-		}
 
-		metric = strings.Replace(metric, "\n", "", -1)
+			value := strconv.FormatFloat(float64(sample.Value), 'f', -1, 64)
 
-		value := strconv.FormatFloat(float64(sample.Value), 'f', -1, 64)
+			now := time.Now()
+			timestamp := now.Unix()
 
-		now := time.Now()
-		timestamp := now.Unix()
+			metric += fmt.Sprintf(" %s %d\n", value, timestamp)
 
-		metric += fmt.Sprintf(" value=%s %d\n", value, timestamp)
-
-		segments := strings.Split(metric, " ")
-		if len(segments) == 3 {
 			metrics += metric
 		}
 	}
@@ -117,21 +99,75 @@ func CreateInfluxMetrics(samples model.Vector, metricPrefix string) string {
 	return metrics
 }
 
-func OutputMetrics(samples model.Vector, outputFormat string, metricPrefix string) error {
+func CreateInfluxMetrics(samples model.Vector, metricPrefix string, metricIgnore string, metricExcept string) string {
+	metrics := ""
+
+	for _, sample := range samples {
+
+		if !skipMetric(metricIgnore, metricExcept, string(sample.Metric["__name__"])) {
+			metric := fmt.Sprintf("%s%s", metricPrefix, sample.Metric["__name__"])
+
+			for name, value := range sample.Metric {
+				if name != "__name__" {
+					tags := fmt.Sprintf(",%s=%s", name, value)
+					if !strings.Contains(tags, "\n") && strings.Count(tags, "=") == 1 {
+						metric += tags
+					}
+				}
+			}
+
+			metric = strings.Replace(metric, "\n", "", -1)
+
+			value := strconv.FormatFloat(float64(sample.Value), 'f', -1, 64)
+
+			now := time.Now()
+			timestamp := now.Unix()
+
+			metric += fmt.Sprintf(" value=%s %d\n", value, timestamp)
+
+			segments := strings.Split(metric, " ")
+			if len(segments) == 3 {
+				metrics += metric
+			}
+		}
+	}
+
+	return metrics
+}
+
+func OutputMetrics(samples model.Vector, outputFormat string, metricPrefix string, metricIgnore string, metricExcept string) error {
 	output := ""
 
 	switch outputFormat {
 	case "influx":
-		output = CreateInfluxMetrics(samples, metricPrefix)
+		output = CreateInfluxMetrics(samples, metricPrefix, metricIgnore, metricExcept)
 	case "graphite":
-		output = CreateGraphiteMetrics(samples, metricPrefix)
+		output = CreateGraphiteMetrics(samples, metricPrefix, metricIgnore, metricExcept)
 	case "json":
-		output = CreateJSONMetrics(samples)
+		output = CreateJSONMetrics(samples, metricIgnore, metricExcept)
 	}
 
 	fmt.Print(output)
 
 	return nil
+}
+
+func skipMetric(metricIgnore string, metricExcept string, name string) bool {
+	exceptRules := strings.Split(metricExcept, ",")
+	for _, prefix := range exceptRules {
+		if prefix != "" && !strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	ignoreRules := strings.Split(metricIgnore, ",")
+	for _, prefix := range ignoreRules {
+		if prefix != "" && strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func QueryPrometheus(promURL string, queryString string) (model.Vector, error) {
@@ -240,6 +276,8 @@ func main() {
 	queryString := flag.String("prom-query", "up", "Prometheus API query string.")
 	outputFormat := flag.String("output-format", "influx", "The check output format to use for metrics {influx|graphite|json}.")
 	metricPrefix := flag.String("metric-prefix", "", "Metric name prefix, only supported by line protocol output formats.")
+	metricExcept := flag.String("metrics-except", "", "Metrics names startswith prefix to keep, comma separated")
+	metricIgnore := flag.String("metrics-ignore", "", "Metrics names startswith prefix to ignore, comma separated")
 	insecureSkipVerify := flag.Bool("insecure-skip-verify", false, "Skip TLS peer verification.")
 	flag.Parse()
 
@@ -270,7 +308,7 @@ func main() {
 		}
 	}
 
-	err = OutputMetrics(samples, *outputFormat, *metricPrefix)
+	err = OutputMetrics(samples, *outputFormat, *metricPrefix, *metricIgnore, *metricExcept)
 
 	if err != nil {
 		_ = fmt.Errorf("error %v", err)
